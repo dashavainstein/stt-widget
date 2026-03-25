@@ -32,8 +32,6 @@ CHANNELS = 1
 
 HOTKEY_COMBO = {keyboard.Key.ctrl_l, keyboard.Key.shift_l, keyboard.Key.space}
 
-MAX_RECORDING_SECONDS = 180  # auto-stop after 3 minutes
-
 COLOR_READY = "#8b5cf6"
 COLOR_RECORDING = "#ff1744"
 COLOR_BUSY = "#1a1a2e"
@@ -46,9 +44,6 @@ client = None
 pressed_keys = set()
 toggle_lock = threading.Lock()
 last_toggle_time = 0
-recording_start_time = 0
-auto_stop_timer = None
-countdown_timer = None
 target_hwnd = None  # Window to paste into (captured at recording start)
 tray_icon_ref = None  # Reference to tray icon for state updates
 tray_icon_creator = None  # Function to create tray icons
@@ -105,6 +100,11 @@ def stop_and_transcribe(btn, root):
     global recording, stream
     recording = False
 
+    # Check if user switched to a different window during recording
+    current_hwnd = ctypes.windll.user32.GetForegroundWindow()
+    # Use current window if user explicitly switched; otherwise use the original
+    paste_hwnd = current_hwnd if current_hwnd and current_hwnd != target_hwnd and ctypes.windll.user32.IsWindow(current_hwnd) else target_hwnd
+
     if stream:
         stream.stop()
         stream.close()
@@ -137,7 +137,7 @@ def stop_and_transcribe(btn, root):
         text = result.strip()
         if text:
             print(f"[OK] {text}")
-            paste_text(text)
+            paste_text(text, paste_hwnd)
         else:
             print("[WARN]  Empty")
     except Exception as e:
@@ -146,12 +146,12 @@ def stop_and_transcribe(btn, root):
     root.after(0, lambda: reset_btn(btn))
 
 
-def paste_text(text):
+def paste_text(text, hwnd=None):
     pyperclip.copy(text)
     user32 = ctypes.windll.user32
-    # Restore focus to the window that was active when recording started
-    if target_hwnd and user32.IsWindow(target_hwnd):
-        user32.SetForegroundWindow(target_hwnd)
+    paste_target = hwnd or target_hwnd
+    if paste_target and user32.IsWindow(paste_target):
+        user32.SetForegroundWindow(paste_target)
     time.sleep(0.25)
     VK_CONTROL = 0x11
     VK_V = 0x56
@@ -172,32 +172,8 @@ def reset_btn(btn):
             w.config(bg=COLOR_READY)
 
 
-def show_limit_popup(root):
-    """Flash a small popup near the button warning that the recording limit was reached."""
-    popup = tk.Toplevel(root)
-    popup.overrideredirect(True)
-    popup.attributes("-topmost", True)
-    popup.configure(bg="#1a1a2e")
-    lbl = tk.Label(
-        popup,
-        text=f"  Limit {MAX_RECORDING_SECONDS // 60} min  ",
-        font=("Segoe UI", 10, "bold"),
-        bg="#1a1a2e",
-        fg="#ff1744",
-        padx=10,
-        pady=6,
-    )
-    lbl.pack()
-    popup.update_idletasks()
-    pw = popup.winfo_reqwidth()
-    x = root.winfo_x() + root.winfo_width() // 2 - pw // 2
-    y = root.winfo_y() - popup.winfo_reqheight() - 6
-    popup.geometry(f"+{x}+{y}")
-    popup.after(3000, popup.destroy)
-
-
 def toggle_recording_ui(btn, root):
-    global last_toggle_time, recording_start_time, auto_stop_timer, countdown_timer
+    global last_toggle_time
     now = time.time()
     if now - last_toggle_time < 0.5:
         return
@@ -206,7 +182,6 @@ def toggle_recording_ui(btn, root):
     with toggle_lock:
         if not recording:
             start_recording()
-            recording_start_time = time.time()
             btn.config(text="STOP", bg=COLOR_RECORDING, fg="white")
             btn.master.config(bg=COLOR_RECORDING)
             # Hide hover elements when recording starts
@@ -217,21 +192,7 @@ def toggle_recording_ui(btn, root):
             # Update tray icon to recording state
             if tray_icon_ref and tray_icon_creator:
                 tray_icon_ref.icon = tray_icon_creator(True)
-            # Schedule auto-stop
-            auto_stop_timer = root.after(
-                MAX_RECORDING_SECONDS * 1000,
-                lambda: auto_stop_recording(btn, root),
-            )
-            # Start countdown display on button
-            update_recording_timer(btn, root)
         else:
-            # Cancel timers
-            if auto_stop_timer is not None:
-                root.after_cancel(auto_stop_timer)
-                auto_stop_timer = None
-            if countdown_timer is not None:
-                root.after_cancel(countdown_timer)
-                countdown_timer = None
             btn.config(text="...", bg=COLOR_BUSY, fg="#8b5cf6", state=tk.DISABLED)
             btn.master.config(bg=COLOR_BUSY)
             # Update tray icon back to idle
@@ -240,29 +201,6 @@ def toggle_recording_ui(btn, root):
             threading.Thread(
                 target=stop_and_transcribe, args=(btn, root), daemon=True
             ).start()
-
-
-def update_recording_timer(btn, root):
-    """Update button text with remaining time while recording."""
-    global countdown_timer
-    if not recording:
-        countdown_timer = None
-        return
-    elapsed = time.time() - recording_start_time
-    remaining = max(0, MAX_RECORDING_SECONDS - int(elapsed))
-    mins, secs = divmod(remaining, 60)
-    btn.config(text=f"{mins}:{secs:02d}")
-    countdown_timer = root.after(1000, lambda: update_recording_timer(btn, root))
-
-
-def auto_stop_recording(btn, root):
-    """Called by timer when MAX_RECORDING_SECONDS exceeded."""
-    global auto_stop_timer
-    auto_stop_timer = None
-    if not recording:
-        return
-    show_limit_popup(root)
-    toggle_recording_ui(btn, root)
 
 
 # ---- Hotkey ----
@@ -289,8 +227,14 @@ def main():
     global client
 
     if sys.platform == "win32":
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        if sys.stdout:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        else:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if sys.stderr:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        else:
+            sys.stderr = open(os.devnull, "w", encoding="utf-8")
         hide_console()
 
     client = OpenAI(api_key=get_api_key(), base_url=GROQ_API_URL)
